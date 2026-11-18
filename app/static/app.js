@@ -9,6 +9,7 @@ const escapeHtml = (s) =>
 let currentVersion = null;
 let currentState = null;
 let lastPreview = null; // {token, version, result, input}
+let lastReview = null;  // {manifestId, result, fileName}
 
 // --------------------------------------------------------------------------- //
 // 基础请求
@@ -63,6 +64,14 @@ $("tplCases").addEventListener("click", (e) => {
 $("tplRel").addEventListener("click", (e) => {
   e.preventDefault();
   downloadCsv("relatives_template.csv", "患者A,患者B\nP001,P002\n");
+});
+$("tplCatalog").addEventListener("click", (e) => {
+  e.preventDefault();
+  const h = "a".repeat(64);
+  downloadCsv(
+    "catalog_template.csv",
+    `病例号,影像号,SHA-256\nC001,IMG0001,${h}\nC001,IMG0002,${h}\nC002,IMG0003,${h}\n`
+  );
 });
 
 // --------------------------------------------------------------------------- //
@@ -373,6 +382,156 @@ async function downloadManifest(id) {
 }
 
 // --------------------------------------------------------------------------- //
+// 影像交付审查
+// --------------------------------------------------------------------------- //
+async function loadReviewManifests() {
+  const sel = $("reviewManifest");
+  try {
+    const r = await api("/api/review/manifests");
+    if (!r.manifests.length) {
+      sel.innerHTML = `<option value="">（暂无有效清单，请先在“求解与发布”发布清单）</option>`;
+      $("reviewManifestHint").textContent = "当前没有任何有效清单。";
+      return;
+    }
+    sel.innerHTML = r.manifests.map((m) =>
+      `<option value="${escapeHtml(m.manifest_id)}">` +
+      `${escapeHtml(m.manifest_id.slice(0, 8))}… · v${m.dataset_version} · ${m.case_count ?? ""} 病例 · ${escapeHtml(m.created_at)}</option>`
+    ).join("");
+    $("reviewManifestHint").textContent =
+      `共 ${r.manifests.length} 份有效清单（当前输入版本 v${r.current_version}）。`;
+  } catch (err) {
+    sel.innerHTML = `<option value="">（加载失败）</option>`;
+    $("reviewManifestHint").textContent = err.message;
+  }
+}
+
+function shortDigest(d) {
+  return d ? d.slice(0, 10) + "…" + d.slice(-6) : "";
+}
+
+async function runReview() {
+  const manifestId = $("reviewManifest").value;
+  const f = $("catalogFile").files[0];
+  setMsg("reviewMsg", "");
+  $("reviewInvalidBanner").classList.add("hidden");
+  $("reviewResult").classList.add("hidden");
+  $("reviewDownloadBtn").disabled = true;
+  if (!manifestId) return setMsg("reviewMsg", "请先选择一份有效清单");
+  if (!f) return setMsg("reviewMsg", "请先选择影像目录 CSV 文件");
+
+  const fd = new FormData();
+  fd.append("file", f);
+  setMsg("reviewMsg", "审查中…");
+  try {
+    const r = await api(`/api/review/${encodeURIComponent(manifestId)}`, { method: "POST", body: fd });
+    lastReview = { manifestId, result: r.result, fileName: f.name };
+    renderReviewResult();
+    setMsg("reviewMsg", `审查完成（依据 v${r.dataset_version}）：可交付 ${r.result.stats.deliverable_count} 例，隔离 ${r.result.stats.isolated_count} 例`, true);
+  } catch (err) {
+    lastReview = null;
+    setMsg("reviewMsg", err.message);
+    if (String(err.message).includes("失效")) {
+      $("reviewInvalidBanner").classList.remove("hidden");
+      loadReviewManifests();
+    }
+  }
+}
+
+function renderReviewResult() {
+  if (!lastReview) return;
+  const { result } = lastReview;
+  const s = result.stats;
+  $("reviewResult").classList.remove("hidden");
+  $("reviewDownloadBtn").disabled = false;
+
+  $("reviewStats").innerHTML = [
+    ["清单病例总数", s.case_total],
+    ["可交付病例", s.deliverable_count],
+    ["隔离病例", s.isolated_count],
+    ["缺片病例", s.missing_count],
+    ["跨组重复摘要", s.duplicate_digest_count],
+    ["分量冲突数", s.conflict_edge_count],
+    ["隔离连通分量", s.isolated_component_count],
+    ["连通分量总数", s.component_total],
+  ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join("");
+
+  $("reviewSummary").textContent =
+    `已按“隔离病例总数最少”求解并独立复核：保留病例不存在任何跨组重复摘要；` +
+    `缺片 ${s.missing_count} 例、因重复摘要/亲属连带隔离的分量 ${s.isolated_component_count} 个。` +
+    `同一份清单与目录重复审查将得到完全一致的建议。`;
+
+  const edgeBody = $("conflictEdgeTable").querySelector("tbody");
+  if (!result.conflict_edges.length) {
+    edgeBody.innerHTML = `<tr><td colspan="5" class="hint">无跨组重复摘要冲突</td></tr>`;
+  } else {
+    edgeBody.innerHTML = result.conflict_edges.map((e) => `<tr>
+      <td>${escapeHtml(e.edge_id)}</td>
+      <td><code title="${escapeHtml(e.digest)}">${escapeHtml(shortDigest(e.digest))}</code></td>
+      <td>${escapeHtml(e.component_a)}（${escapeHtml(e.group_a_name)}）</td>
+      <td>${escapeHtml(e.component_b)}（${escapeHtml(e.group_b_name)}）</td>
+      <td>${escapeHtml(e.case_a)} ⇄ ${escapeHtml(e.case_b)}</td>
+    </tr>`).join("");
+  }
+  renderReviewCases();
+}
+
+function renderReviewCases() {
+  if (!lastReview) return;
+  const dFilter = $("reviewDecisionFilter").value;
+  const gFilter = $("reviewGroupFilter").value;
+  const rows = lastReview.result.cases
+    .filter((c) => (!dFilter || c.decision === dFilter) && (!gFilter || String(c.group) === gFilter))
+    .map((c) => {
+      const reasons = c.reasons.length
+        ? c.reasons.map((r) => `<span class="pill ${r.kind === "missing" ? "dead" : "warn"}">${escapeHtml(r.kind_name)}</span> ${escapeHtml(r.detail)}`).join("<br>")
+        : '<span class="pill ok">无异常</span>';
+      const pill = c.decision === "deliverable"
+        ? '<span class="pill ok">可交付</span>'
+        : '<span class="pill dead">隔离</span>';
+      return `<tr>
+        <td>${escapeHtml(c.case_id)}</td>
+        <td>${escapeHtml(c.patient_id)}</td>
+        <td>${escapeHtml(c.group_name)}</td>
+        <td>${escapeHtml(c.component_id)}</td>
+        <td>${c.image_count}</td>
+        <td>${pill}</td>
+        <td style="white-space:normal;min-width:280px">${reasons}</td>
+      </tr>`;
+    }).join("");
+  $("reviewCaseTable").querySelector("tbody").innerHTML = rows
+    || `<tr><td colspan="7" class="hint">没有匹配的病例</td></tr>`;
+}
+
+async function downloadReviewCsv() {
+  if (!lastReview) return;
+  const f = $("catalogFile").files[0];
+  if (!f) return setMsg("reviewMsg", "请重新选择影像目录文件后再下载");
+  const fd = new FormData();
+  fd.append("file", f);
+  const resp = await fetch(`/api/review/${encodeURIComponent(lastReview.manifestId)}/download`, {
+    method: "POST",
+    body: fd,
+  });
+  if (!resp.ok) {
+    let msg = `下载被拒绝（HTTP ${resp.status}）`;
+    try { msg = (await resp.json()).detail || msg; } catch { /* ignore */ }
+    setMsg("reviewMsg", msg);
+    if (String(msg).includes("失效")) {
+      $("reviewInvalidBanner").classList.remove("hidden");
+      loadReviewManifests();
+    }
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `delivery_review_${lastReview.manifestId.slice(0, 8)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// --------------------------------------------------------------------------- //
 // 版本日志
 // --------------------------------------------------------------------------- //
 async function loadVersionLog() {
@@ -395,6 +554,7 @@ async function refreshAll(showStaleBanner = false) {
     const prevVersion = currentVersion;
     currentState = await api("/api/state");
     renderState();
+    loadReviewManifests();
     $("healthBadge").textContent = "已连接";
     $("healthBadge").className = "badge";
     const changed = prevVersion !== null && prevVersion !== currentState.dataset_version;

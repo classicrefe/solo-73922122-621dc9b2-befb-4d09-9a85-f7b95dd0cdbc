@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import Database, StaleVersionError
+from .delivery import ReviewError, parse_catalog_csv, review_delivery
 from .models import (
     ActiveInput,
     ValidationError,
@@ -23,6 +24,7 @@ from .models import (
     validate_locks,
     validate_quotas,
 )
+from .splitter import Case as SplitCase, RelativePair as SplitRelativePair
 from .splitter import SplitterError, solve_split
 
 import os
@@ -102,6 +104,14 @@ async def _validation_handler(_request, exc: ValidationError):
 @app.exception_handler(SplitterError)
 async def _splitter_handler(_request, exc: SplitterError):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(ReviewError)
+async def _review_handler(_request, exc: ReviewError):
+    # 目录整体不合法：返回结构化错误列表，不产生结果，也不改动既有输入与清单
+    return JSONResponse(
+        status_code=400, content={"detail": "影像目录审查失败", "errors": exc.args[0]}
+    )
 
 
 @app.exception_handler(StaleVersionError)
@@ -282,6 +292,113 @@ def manifest_download(manifest_id: str):
 @app.get("/api/version-log")
 def version_log():
     return {"current_version": db.get_version(), "log": db.version_log()}
+
+
+# --------------------------------------------------------------------------- #
+# 影像交付审查（只读；不改动当前输入与任何已发布清单）
+# --------------------------------------------------------------------------- #
+def _load_valid_manifest(manifest_id: str) -> dict:
+    manifest = db.get_manifest(manifest_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="清单不存在。")
+    if manifest["expired"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "该清单已失效（输入已变动，清单被标记 invalidated），"
+                "不能作为影像交付审查依据，请改选有效清单。"
+            ),
+        )
+    return manifest
+
+
+@app.get("/api/review/manifests")
+def review_manifests():
+    """供网页下拉选择：仅返回当前仍有效的已发布清单。"""
+    return {
+        "current_version": db.get_version(),
+        "manifests": [m for m in db.list_manifests() if not m["expired"]],
+    }
+
+
+def _run_review(manifest_id: str, raw: bytes) -> Tuple[dict, dict, list]:
+    """共享的审查流程：解析校验 -> 求解 -> 失效复核。返回 (manifest, result, entries)。"""
+    manifest = _load_valid_manifest(manifest_id)
+    start_version = db.get_version()
+    input_data = manifest["input"]
+    assignments = manifest["result"]["assignments"]
+
+    # 复用 splitter 的 Case/RelativePair 数据结构
+    cases = [SplitCase(case_id=c["case_id"], patient_id=c["patient_id"], label=c["label"])
+             for c in input_data["cases"]]
+    relatives = [SplitRelativePair(patient_a=r["patient_a"], patient_b=r["patient_b"])
+                 for r in input_data.get("relatives", [])]
+    known_case_ids = [c.case_id for c in cases]
+
+    # 解析/校验全部通过前不产生任何结果；失败不触碰既有数据
+    entries = parse_catalog_csv(raw, known_case_ids)
+    result = review_delivery(cases, relatives, assignments, entries)
+
+    # 计算结束后复核：审查期间清单若失效，绝不给出可交付结论
+    current_version = db.get_version()
+    if current_version != start_version or _load_valid_manifest(manifest_id)["expired"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"审查所依据的清单在审查期间已失效（版本 {start_version} -> "
+                f"{current_version}），本次不给出可交付结论，请在有效清单上重新审查。"
+            ),
+        )
+    return manifest, result, entries
+
+
+@app.post("/api/review/{manifest_id}")
+async def review_manifest(manifest_id: str, file: UploadFile = File(...)):
+    raw = await _read_upload(file)
+    manifest, result, _entries = _run_review(manifest_id, raw)
+    return {
+        "manifest_id": manifest_id,
+        "dataset_version": manifest["dataset_version"],
+        "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "result": result,
+    }
+
+
+@app.post("/api/review/{manifest_id}/download")
+async def review_download(manifest_id: str, file: UploadFile = File(...)):
+    raw = await _read_upload(file)
+    manifest, result, _entries = _run_review(manifest_id, raw)
+
+    lines = [
+        "病例号,患者号,分组,连通分量,影像数,影像号,摘要,审查结论,隔离依据"
+    ]
+    for row in result["cases"]:
+        reason_text = "；".join(
+            f"[{r['kind_name']}] {r['detail']}" for r in row["reasons"]
+        ) or ("—" if row["decision"] == "deliverable" else "")
+        lines.append(
+            ",".join([
+                row["case_id"],
+                row["patient_id"],
+                row["group_name"],
+                row["component_id"],
+                str(row["image_count"]),
+                "|".join(row["image_ids"]),
+                "|".join(row["digests"]),
+                row["decision_name"],
+                reason_text,
+            ])
+        )
+    csv_text = "﻿" + "\n".join(lines) + "\n"
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="delivery_review_{manifest_id[:8]}.csv"'
+            )
+        },
+    )
 
 
 # 静态前端（最后挂载，避免覆盖 /api 路由）

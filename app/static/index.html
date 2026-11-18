@@ -24,8 +24,9 @@
   <button class="tab active" data-tab="data">① 数据上传</button>
   <button class="tab" data-tab="quota">② 配额与锁定</button>
   <button class="tab" data-tab="solve">③ 求解与发布</button>
-  <button class="tab" data-tab="manifests">④ 已发布清单</button>
-  <button class="tab" data-tab="log">⑤ 版本记录</button>
+  <button class="tab" data-tab="review">④ 影像交付审查</button>
+  <button class="tab" data-tab="manifests">⑤ 已发布清单</button>
+  <button class="tab" data-tab="log">⑥ 版本记录</button>
 </nav>
 
 <!-- ======================= Tab 1 数据 ======================= -->
@@ -152,7 +153,69 @@
   </div>
 </section>
 
-<!-- ======================= Tab 4 清单 ======================= -->
+<!-- ======================= Tab 4 影像交付审查 ======================= -->
+<section class="panel" id="tab-review">
+  <h2>影像交付审查</h2>
+  <p class="hint">发放已发布清单对应的影像前，依据影像目录找出两组共享内容并决定暂停交付的病例。
+    审查为只读操作，不会改动当前输入与清单；同一份输入重复审查给出相同建议。</p>
+
+  <h3>1. 选择有效清单</h3>
+  <div class="row">
+    <select id="reviewManifest" style="min-width:320px"></select>
+    <button onclick="loadReviewManifests()">刷新有效清单</button>
+  </div>
+  <p class="hint" id="reviewManifestHint">仅列出当前仍有效（未因输入变动而失效）的已发布清单。</p>
+
+  <h3>2. 上传影像目录 CSV（至多 200 行）</h3>
+  <p class="hint">列：<code>病例号, 影像号, SHA-256</code>。一例可对应多张；影像号不得重复；
+    病例号必须在所选清单内；摘要为 64 位十六进制。
+    <a href="#" id="tplCatalog">下载影像目录模板</a></p>
+  <div class="row">
+    <input type="file" id="catalogFile" accept=".csv,text/csv">
+    <button class="primary" onclick="runReview()">开始审查</button>
+    <button id="reviewDownloadBtn" onclick="downloadReviewCsv()" disabled>下载审查结果 CSV</button>
+    <span id="reviewMsg" class="msg"></span>
+  </div>
+  <div id="reviewInvalidBanner" class="banner hidden">
+    <b>所选清单已在审查期间失效。</b>本次不给出可交付结论，请刷新清单列表后在有效清单上重新审查。
+  </div>
+
+  <div id="reviewResult" class="hidden">
+    <h3>3. 审查结论</h3>
+    <div id="reviewStats" class="grid4"></div>
+    <div id="reviewSummary" class="banner warn"></div>
+
+    <h3>跨组重复摘要冲突（分量级）</h3>
+    <div class="table-wrap">
+      <table id="conflictEdgeTable"><thead>
+        <tr><th>冲突</th><th>SHA-256 摘要</th><th>分量 A（组）</th><th>分量 B（组）</th><th>代表病例</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+
+    <div class="row">
+      <label>结论筛选：
+        <select id="reviewDecisionFilter" onchange="renderReviewCases()">
+          <option value="">全部</option>
+          <option value="deliverable">仅可交付</option>
+          <option value="isolated">仅隔离</option>
+        </select>
+      </label>
+      <label>分组：
+        <select id="reviewGroupFilter" onchange="renderReviewCases()">
+          <option value="">全部</option><option value="1">训练集</option><option value="2">评估集</option>
+        </select>
+      </label>
+    </div>
+    <div class="table-wrap">
+      <table id="reviewCaseTable"><thead>
+        <tr><th>病例号</th><th>患者号</th><th>分组</th><th>连通分量</th><th>影像数</th>
+        <th>结论</th><th>依据</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= Tab 5 清单 ======================= -->
 <section class="panel" id="tab-manifests">
   <h2>已发布清单</h2>
   <p class="hint">清单与其输入依据一起持久化。输入一旦变动（即使改回原值），旧清单立即永久失效，
